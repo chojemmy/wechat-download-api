@@ -32,6 +32,140 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return (row["sql"] or "") if row else ""
+
+
+def _legacy_owner_user_id() -> int:
+    try:
+        from utils import user_store
+        user_store.init_user_db()
+        username = os.getenv("APP_BOOTSTRAP_USERNAME", "admin")
+        password = os.getenv("APP_BOOTSTRAP_PASSWORD", "admin123456")
+        user = user_store.get_user_by_username(username)
+        if not user:
+            user = user_store.create_user(username, password, os.getenv("APP_BOOTSTRAP_DISPLAY_NAME", "Administrator"))
+            logger.warning("Created bootstrap application user %r; change APP_BOOTSTRAP_PASSWORD after deployment", username)
+        return int(user["id"])
+    except Exception as e:
+        logger.warning("Could not resolve bootstrap user for legacy data migration: %s", e)
+        return 0
+
+
+def _ensure_multi_user_schema(conn: sqlite3.Connection):
+    """Upgrade original single-user SQLite tables to user-scoped tables.
+
+    SQLite cannot add composite UNIQUE constraints to an existing table with ALTER.
+    When the original schema is detected, rebuild the table and copy existing rows
+    to the bootstrap admin user so old deployments keep their data.
+    """
+    owner_id = _legacy_owner_user_id()
+
+    # categories: old schema had UNIQUE(name), new schema has UNIQUE(user_id, name)
+    if "categories" in _table_sql(conn, "categories") and "user_id" not in _table_columns(conn, "categories"):
+        conn.executescript("""
+            ALTER TABLE categories RENAME TO categories_legacy;
+            CREATE TABLE categories (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL DEFAULT 0,
+                name        TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                color       TEXT NOT NULL DEFAULT 'blue',
+                sort_order  INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL,
+                UNIQUE(user_id, name)
+            );
+        """)
+        conn.execute("INSERT INTO categories (id, user_id, name, description, color, sort_order, created_at) SELECT id, ?, name, description, color, sort_order, created_at FROM categories_legacy", (owner_id,))
+        conn.execute("DROP TABLE categories_legacy")
+
+    # blacklist: old schema had UNIQUE(fakeid), new schema has UNIQUE(user_id, fakeid)
+    if "fakeid_blacklist" in _table_sql(conn, "fakeid_blacklist") and "user_id" not in _table_columns(conn, "fakeid_blacklist"):
+        conn.executescript("""
+            ALTER TABLE fakeid_blacklist RENAME TO fakeid_blacklist_legacy;
+            CREATE TABLE fakeid_blacklist (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL DEFAULT 0,
+                fakeid      TEXT NOT NULL,
+                nickname    TEXT NOT NULL DEFAULT '',
+                reason      TEXT NOT NULL DEFAULT 'manual',
+                verification_count INTEGER NOT NULL DEFAULT 0,
+                is_active   INTEGER NOT NULL DEFAULT 1,
+                blacklisted_at INTEGER NOT NULL,
+                unblacklisted_at INTEGER DEFAULT NULL,
+                note        TEXT NOT NULL DEFAULT '',
+                UNIQUE(user_id, fakeid)
+            );
+        """)
+        conn.execute("INSERT INTO fakeid_blacklist (id, user_id, fakeid, nickname, reason, verification_count, is_active, blacklisted_at, unblacklisted_at, note) SELECT id, ?, fakeid, nickname, reason, verification_count, is_active, blacklisted_at, unblacklisted_at, note FROM fakeid_blacklist_legacy", (owner_id,))
+        conn.execute("DROP TABLE fakeid_blacklist_legacy")
+
+    sub_sql = _table_sql(conn, "subscriptions")
+    if sub_sql and ("user_id" not in _table_columns(conn, "subscriptions") or "PRIMARY KEY (user_id, fakeid)" not in sub_sql):
+        cols = _table_columns(conn, "subscriptions")
+        if "category_id" not in cols:
+            conn.execute("ALTER TABLE subscriptions ADD COLUMN category_id INTEGER DEFAULT NULL")
+        conn.executescript("""
+            ALTER TABLE subscriptions RENAME TO subscriptions_legacy;
+            CREATE TABLE subscriptions (
+                user_id     INTEGER NOT NULL DEFAULT 0,
+                fakeid      TEXT NOT NULL,
+                nickname    TEXT NOT NULL DEFAULT '',
+                alias       TEXT NOT NULL DEFAULT '',
+                head_img    TEXT NOT NULL DEFAULT '',
+                category_id INTEGER DEFAULT NULL,
+                created_at  INTEGER NOT NULL,
+                last_poll   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, fakeid),
+                FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+            );
+        """)
+        conn.execute("INSERT OR IGNORE INTO subscriptions (user_id, fakeid, nickname, alias, head_img, category_id, created_at, last_poll) SELECT ?, fakeid, nickname, alias, head_img, category_id, created_at, last_poll FROM subscriptions_legacy", (owner_id,))
+        conn.execute("DROP TABLE subscriptions_legacy")
+
+    art_sql = _table_sql(conn, "articles")
+    if art_sql and ("user_id" not in _table_columns(conn, "articles") or "UNIQUE(user_id, fakeid, link)" not in art_sql):
+        cols = _table_columns(conn, "articles")
+        if "source" not in cols:
+            conn.execute("ALTER TABLE articles ADD COLUMN source TEXT NOT NULL DEFAULT 'poll'")
+        conn.executescript("""
+            ALTER TABLE articles RENAME TO articles_legacy;
+            CREATE TABLE articles (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL DEFAULT 0,
+                fakeid      TEXT NOT NULL,
+                aid         TEXT NOT NULL DEFAULT '',
+                title       TEXT NOT NULL DEFAULT '',
+                link        TEXT NOT NULL DEFAULT '',
+                digest      TEXT NOT NULL DEFAULT '',
+                cover       TEXT NOT NULL DEFAULT '',
+                author      TEXT NOT NULL DEFAULT '',
+                content     TEXT NOT NULL DEFAULT '',
+                plain_content TEXT NOT NULL DEFAULT '',
+                publish_time INTEGER NOT NULL DEFAULT 0,
+                fetched_at  INTEGER NOT NULL,
+                source      TEXT NOT NULL DEFAULT 'poll',
+                UNIQUE(user_id, fakeid, link)
+            );
+        """)
+        conn.execute("INSERT OR IGNORE INTO articles (id, user_id, fakeid, aid, title, link, digest, cover, author, content, plain_content, publish_time, fetched_at, source) SELECT id, ?, fakeid, aid, title, link, digest, cover, author, content, plain_content, publish_time, fetched_at, source FROM articles_legacy", (owner_id,))
+        conn.execute("DROP TABLE articles_legacy")
+
+    if _table_sql(conn, "fakeid_blacklist"):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_active ON fakeid_blacklist(user_id, is_active)")
+    if _table_sql(conn, "articles"):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_articles_fakeid_time ON articles(user_id, fakeid, publish_time DESC)")
+    if _table_sql(conn, "subscriptions"):
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_category ON subscriptions(user_id, category_id)")
+    conn.commit()
+
 def init_db():
     """建表（幂等）"""
     conn = _get_conn()
@@ -41,28 +175,41 @@ def init_db():
         -- 分类表（先创建，因为 subscriptions 依赖它）
         CREATE TABLE IF NOT EXISTS categories (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL UNIQUE,
+            user_id     INTEGER NOT NULL DEFAULT 0,
+            name        TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             color       TEXT NOT NULL DEFAULT 'blue',
             sort_order  INTEGER NOT NULL DEFAULT 0,
-            created_at  INTEGER NOT NULL
+            created_at  INTEGER NOT NULL,
+            UNIQUE(user_id, name)
         );
         
         -- 黑名单表
         CREATE TABLE IF NOT EXISTS fakeid_blacklist (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            fakeid      TEXT NOT NULL UNIQUE,
+            user_id     INTEGER NOT NULL DEFAULT 0,
+            fakeid      TEXT NOT NULL,
             nickname    TEXT NOT NULL DEFAULT '',
             reason      TEXT NOT NULL DEFAULT 'manual',
             verification_count INTEGER NOT NULL DEFAULT 0,
             is_active   INTEGER NOT NULL DEFAULT 1,
             blacklisted_at INTEGER NOT NULL,
             unblacklisted_at INTEGER DEFAULT NULL,
-            note        TEXT NOT NULL DEFAULT ''
+            note        TEXT NOT NULL DEFAULT '',
+            UNIQUE(user_id, fakeid)
         );
         
-        CREATE INDEX IF NOT EXISTS idx_blacklist_active ON fakeid_blacklist(is_active);
+        CREATE INDEX IF NOT EXISTS idx_blacklist_active ON fakeid_blacklist(user_id, is_active);
     """)
+    conn.commit()
+    _ensure_multi_user_schema(conn)
+
+    # Lightweight migrations for databases created by the original single-user schema.
+    for table in ("categories", "fakeid_blacklist"):
+        cursor = conn.execute(f"PRAGMA table_info({table})")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "user_id" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     
     # 检查 subscriptions 表是否存在
@@ -80,17 +227,23 @@ def init_db():
             conn.execute("ALTER TABLE subscriptions ADD COLUMN category_id INTEGER DEFAULT NULL")
             conn.commit()
             logger.info("Added category_id column to subscriptions table")
+        if "user_id" not in columns:
+            conn.execute("ALTER TABLE subscriptions ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+            logger.info("Added user_id column to subscriptions table")
     else:
         # 表不存在，创建新表
         conn.executescript("""
             CREATE TABLE subscriptions (
-                fakeid      TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL DEFAULT 0,
+                fakeid      TEXT NOT NULL,
                 nickname    TEXT NOT NULL DEFAULT '',
                 alias       TEXT NOT NULL DEFAULT '',
                 head_img    TEXT NOT NULL DEFAULT '',
                 category_id INTEGER DEFAULT NULL,
                 created_at  INTEGER NOT NULL,
                 last_poll   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, fakeid),
                 FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
             );
         """)
@@ -100,6 +253,7 @@ def init_db():
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS articles (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL DEFAULT 0,
             fakeid      TEXT NOT NULL,
             aid         TEXT NOT NULL DEFAULT '',
             title       TEXT NOT NULL DEFAULT '',
@@ -111,19 +265,22 @@ def init_db():
             plain_content TEXT NOT NULL DEFAULT '',
             publish_time INTEGER NOT NULL DEFAULT 0,
             fetched_at  INTEGER NOT NULL,
-            UNIQUE(fakeid, link),
-            FOREIGN KEY (fakeid) REFERENCES subscriptions(fakeid) ON DELETE CASCADE
+            UNIQUE(user_id, fakeid, link)
         );
 
         CREATE INDEX IF NOT EXISTS idx_articles_fakeid_time
-            ON articles(fakeid, publish_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_subscriptions_category ON subscriptions(category_id);
+            ON articles(user_id, fakeid, publish_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_category ON subscriptions(user_id, category_id);
     """)
     conn.commit()
     
     # 检查并添加 source 字段（用于区分轮询器文章和历史文章）
     cursor = conn.execute("PRAGMA table_info(articles)")
     columns = [row[1] for row in cursor.fetchall()]
+    if "user_id" not in columns:
+        logger.info("Adding user_id column to articles table")
+        conn.execute("ALTER TABLE articles ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
     if "source" not in columns:
         logger.info("Adding source column to articles table")
         conn.execute("ALTER TABLE articles ADD COLUMN source TEXT NOT NULL DEFAULT 'poll'")
@@ -138,13 +295,13 @@ def init_db():
 # ── 订阅管理 ─────────────────────────────────────────────
 
 def add_subscription(fakeid: str, nickname: str = "",
-                     alias: str = "", head_img: str = "") -> bool:
+                     alias: str = "", head_img: str = "", user_id: int = 0) -> bool:
     conn = _get_conn()
     try:
         conn.execute(
             "INSERT OR IGNORE INTO subscriptions "
-            "(fakeid, nickname, alias, head_img, created_at) VALUES (?,?,?,?,?)",
-            (fakeid, nickname, alias, head_img, int(time.time())),
+            "(user_id, fakeid, nickname, alias, head_img, created_at) VALUES (?,?,?,?,?,?)",
+            (user_id, fakeid, nickname, alias, head_img, int(time.time())),
         )
         conn.commit()
         return conn.total_changes > 0
@@ -152,48 +309,50 @@ def add_subscription(fakeid: str, nickname: str = "",
         conn.close()
 
 
-def remove_subscription(fakeid: str) -> bool:
+def remove_subscription(fakeid: str, user_id: int = 0) -> bool:
     conn = _get_conn()
     try:
-        conn.execute("DELETE FROM subscriptions WHERE fakeid=?", (fakeid,))
+        conn.execute("DELETE FROM subscriptions WHERE user_id=? AND fakeid=?", (user_id, fakeid))
         conn.commit()
         return conn.total_changes > 0
     finally:
         conn.close()
 
 
-def list_subscriptions() -> List[Dict]:
+def list_subscriptions(user_id: int = 0) -> List[Dict]:
     conn = _get_conn()
     try:
         rows = conn.execute(
             "SELECT s.*, c.name AS category_name, "
-            "(SELECT COUNT(*) FROM articles a WHERE a.fakeid=s.fakeid) AS article_count "
+            "(SELECT COUNT(*) FROM articles a WHERE a.user_id=s.user_id AND a.fakeid=s.fakeid) AS article_count "
             "FROM subscriptions s "
-            "LEFT JOIN categories c ON s.category_id = c.id "
-            "ORDER BY s.created_at DESC"
+            "LEFT JOIN categories c ON s.category_id = c.id AND c.user_id=s.user_id "
+            "WHERE s.user_id=? "
+            "ORDER BY s.created_at DESC",
+            (user_id,)
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_subscription(fakeid: str) -> Optional[Dict]:
+def get_subscription(fakeid: str, user_id: int = 0) -> Optional[Dict]:
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT * FROM subscriptions WHERE fakeid=?", (fakeid,)
+            "SELECT * FROM subscriptions WHERE user_id=? AND fakeid=?", (user_id, fakeid)
         ).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
 
 
-def update_last_poll(fakeid: str):
+def update_last_poll(fakeid: str, user_id: int = 0):
     conn = _get_conn()
     try:
         conn.execute(
-            "UPDATE subscriptions SET last_poll=? WHERE fakeid=?",
-            (int(time.time()), fakeid),
+            "UPDATE subscriptions SET last_poll=? WHERE user_id=? AND fakeid=?",
+            (int(time.time()), user_id, fakeid),
         )
         conn.commit()
     finally:
@@ -202,7 +361,7 @@ def update_last_poll(fakeid: str):
 
 # ── 文章缓存 ─────────────────────────────────────────────
 
-def save_articles(fakeid: str, articles: List[Dict], source: str = "poll") -> int:
+def save_articles(fakeid: str, articles: List[Dict], source: str = "poll", user_id: int = 0) -> int:
     """
     批量保存文章，返回新增数量。
     If an article already exists but has empty content, update it with new content.
@@ -221,10 +380,10 @@ def save_articles(fakeid: str, articles: List[Dict], source: str = "poll") -> in
             try:
                 cursor = conn.execute(
                     "INSERT INTO articles "
-                    "(fakeid, aid, title, link, digest, cover, author, "
+                    "(user_id, fakeid, aid, title, link, digest, cover, author, "
                     "content, plain_content, publish_time, fetched_at, source) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(fakeid, link) DO UPDATE SET "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(user_id, fakeid, link) DO UPDATE SET "
                     "content = CASE WHEN excluded.content != '' AND articles.content = '' "
                     "  THEN excluded.content ELSE articles.content END, "
                     "plain_content = CASE WHEN excluded.plain_content != '' AND articles.plain_content = '' "
@@ -232,6 +391,7 @@ def save_articles(fakeid: str, articles: List[Dict], source: str = "poll") -> in
                     "author = CASE WHEN excluded.author != '' AND articles.author = '' "
                     "  THEN excluded.author ELSE articles.author END",
                     (
+                        user_id,
                         fakeid,
                         a.get("aid", ""),
                         a.get("title", ""),
@@ -256,20 +416,20 @@ def save_articles(fakeid: str, articles: List[Dict], source: str = "poll") -> in
         conn.close()
 
 
-def get_articles(fakeid: str, limit: int = 20) -> List[Dict]:
+def get_articles(fakeid: str, limit: int = 20, user_id: int = 0) -> List[Dict]:
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT * FROM articles WHERE fakeid=? "
+            "SELECT * FROM articles WHERE user_id=? AND fakeid=? "
             "ORDER BY publish_time DESC LIMIT ?",
-            (fakeid, limit),
+            (user_id, fakeid, limit),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_regular_articles(fakeid: str, limit: int = 50) -> List[Dict]:
+def get_regular_articles(fakeid: str, limit: int = 50, user_id: int = 0) -> List[Dict]:
     """
     获取常规文章（轮询器拉取的文章）
     只返回 source='poll' 的文章，不包含历史文章
@@ -277,16 +437,16 @@ def get_regular_articles(fakeid: str, limit: int = 50) -> List[Dict]:
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT * FROM articles WHERE fakeid=? AND source='poll' "
+            "SELECT * FROM articles WHERE user_id=? AND fakeid=? AND source='poll' "
             "ORDER BY publish_time DESC LIMIT ?",
-            (fakeid, limit),
+            (user_id, fakeid, limit),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_historical_articles(fakeid: str, limit: int = 500, offset: int = 0) -> List[Dict]:
+def get_historical_articles(fakeid: str, limit: int = 500, offset: int = 0, user_id: int = 0) -> List[Dict]:
     """
     获取历史文章（通过"获取历史文章"功能拉取的文章）
     返回 source='deep_fetch' 的文章，用于独立的历史 RSS，支持分页
@@ -294,38 +454,38 @@ def get_historical_articles(fakeid: str, limit: int = 500, offset: int = 0) -> L
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT * FROM articles WHERE fakeid=? AND source='deep_fetch' "
+            "SELECT * FROM articles WHERE user_id=? AND fakeid=? AND source='deep_fetch' "
             "ORDER BY publish_time DESC LIMIT ? OFFSET ?",
-            (fakeid, limit, offset),
+            (user_id, fakeid, limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def count_historical_articles(fakeid: str) -> int:
+def count_historical_articles(fakeid: str, user_id: int = 0) -> int:
     """统计历史文章数量（source='deep_fetch'的文章）"""
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM articles WHERE fakeid=? AND source='deep_fetch'",
-            (fakeid,),
+            "SELECT COUNT(*) as cnt FROM articles WHERE user_id=? AND fakeid=? AND source='deep_fetch'",
+            (user_id, fakeid),
         ).fetchone()
         return row["cnt"] if row else 0
     finally:
         conn.close()
 
 
-def get_all_fakeids() -> List[str]:
+def get_all_fakeids(user_id: int = 0) -> List[str]:
     conn = _get_conn()
     try:
-        rows = conn.execute("SELECT fakeid FROM subscriptions").fetchall()
+        rows = conn.execute("SELECT fakeid FROM subscriptions WHERE user_id=?", (user_id,)).fetchall()
         return [r["fakeid"] for r in rows]
     finally:
         conn.close()
 
 
-def get_all_articles(limit: int = 50) -> List[Dict]:
+def get_all_articles(limit: int = 50, user_id: int = 0) -> List[Dict]:
     """
     获取所有订阅的常规文章（聚合RSS）
     只返回轮询器拉取的文章（source='poll'），不包含历史文章
@@ -338,7 +498,7 @@ def get_all_articles(limit: int = 50) -> List[Dict]:
     conn = _get_conn()
     try:
         # 获取所有订阅的fakeid
-        subs = conn.execute("SELECT fakeid FROM subscriptions").fetchall()
+        subs = conn.execute("SELECT fakeid FROM subscriptions WHERE user_id=?", (user_id,)).fetchall()
         if not subs:
             return []
         
@@ -364,14 +524,14 @@ def get_all_articles(limit: int = 50) -> List[Dict]:
                         ORDER BY publish_time DESC
                     ) AS rn
                 FROM articles
-                WHERE fakeid IN ({placeholders}) AND source='poll'
+                WHERE user_id=? AND fakeid IN ({placeholders}) AND source='poll'
             )
             SELECT * FROM ranked_articles
             WHERE rn <= ?
             ORDER BY publish_time DESC
             LIMIT ?
             """,
-            (*fakeid_list, per_sub_limit, total_limit),
+            (user_id, *fakeid_list, per_sub_limit, total_limit),
         ).fetchall()
         
         return [dict(r) for r in rows]
@@ -443,15 +603,15 @@ def _calculate_aggregated_limits(subscription_count: int) -> tuple:
 # ── 黑名单管理 ─────────────────────────────────────────────
 
 def add_to_blacklist(fakeid: str, nickname: str = "", reason: str = "manual",
-                     verification_count: int = 0, note: str = "") -> bool:
+                     verification_count: int = 0, note: str = "", user_id: int = 0) -> bool:
     """添加公众号到黑名单"""
     conn = _get_conn()
     try:
         conn.execute(
             "INSERT OR REPLACE INTO fakeid_blacklist "
-            "(fakeid, nickname, reason, verification_count, is_active, blacklisted_at, note) "
-            "VALUES (?,?,?,?,1,?,?)",
-            (fakeid, nickname, reason, verification_count, int(time.time()), note),
+            "(user_id, fakeid, nickname, reason, verification_count, is_active, blacklisted_at, note) "
+            "VALUES (?,?,?,?,?,1,?,?)",
+            (user_id, fakeid, nickname, reason, verification_count, int(time.time()), note),
         )
         conn.commit()
         logger.info("Added %s to blacklist: %s", fakeid[:8], reason)
@@ -460,13 +620,13 @@ def add_to_blacklist(fakeid: str, nickname: str = "", reason: str = "manual",
         conn.close()
 
 
-def remove_from_blacklist(fakeid: str) -> bool:
+def remove_from_blacklist(fakeid: str, user_id: int = 0) -> bool:
     """从黑名单移除（标记为非活跃）"""
     conn = _get_conn()
     try:
         conn.execute(
-            "UPDATE fakeid_blacklist SET is_active=0, unblacklisted_at=? WHERE fakeid=?",
-            (int(time.time()), fakeid),
+            "UPDATE fakeid_blacklist SET is_active=0, unblacklisted_at=? WHERE user_id=? AND fakeid=?",
+            (int(time.time()), user_id, fakeid),
         )
         conn.commit()
         return conn.total_changes > 0
@@ -474,55 +634,56 @@ def remove_from_blacklist(fakeid: str) -> bool:
         conn.close()
 
 
-def delete_blacklist_record(blacklist_id: int) -> bool:
+def delete_blacklist_record(blacklist_id: int, user_id: int = 0) -> bool:
     """永久删除黑名单记录"""
     conn = _get_conn()
     try:
-        conn.execute("DELETE FROM fakeid_blacklist WHERE id=? AND is_active=0", (blacklist_id,))
+        conn.execute("DELETE FROM fakeid_blacklist WHERE id=? AND user_id=? AND is_active=0", (blacklist_id, user_id))
         conn.commit()
         return conn.total_changes > 0
     finally:
         conn.close()
 
 
-def is_blacklisted(fakeid: str) -> bool:
+def is_blacklisted(fakeid: str, user_id: int = 0) -> bool:
     """检查公众号是否在黑名单中"""
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT 1 FROM fakeid_blacklist WHERE fakeid=? AND is_active=1",
-            (fakeid,),
+            "SELECT 1 FROM fakeid_blacklist WHERE user_id=? AND fakeid=? AND is_active=1",
+            (user_id, fakeid),
         ).fetchone()
         return row is not None
     finally:
         conn.close()
 
 
-def get_blacklist() -> List[Dict]:
+def get_blacklist(user_id: int = 0) -> List[Dict]:
     """获取黑名单列表"""
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT * FROM fakeid_blacklist ORDER BY blacklisted_at DESC"
-        ).fetchall()
+            "SELECT * FROM fakeid_blacklist WHERE user_id=? ORDER BY blacklisted_at DESC"
+        , (user_id,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_active_blacklist_fakeids() -> List[str]:
+def get_active_blacklist_fakeids(user_id: int = 0) -> List[str]:
     """获取活跃黑名单的 fakeid 列表"""
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT fakeid FROM fakeid_blacklist WHERE is_active=1"
+            "SELECT fakeid FROM fakeid_blacklist WHERE user_id=? AND is_active=1",
+            (user_id,),
         ).fetchall()
         return [r["fakeid"] for r in rows]
     finally:
         conn.close()
 
 
-def increment_verification_count(fakeid: str, nickname: str = "") -> int:
+def increment_verification_count(fakeid: str, nickname: str = "", user_id: int = 0) -> int:
     """
     增加验证码触发次数，达到阈值时自动加入黑名单
 
@@ -540,7 +701,7 @@ def increment_verification_count(fakeid: str, nickname: str = "") -> int:
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT * FROM fakeid_blacklist WHERE fakeid=?", (fakeid,)
+            "SELECT * FROM fakeid_blacklist WHERE user_id=? AND fakeid=?", (user_id, fakeid)
         ).fetchone()
 
         if row:
@@ -553,24 +714,24 @@ def increment_verification_count(fakeid: str, nickname: str = "") -> int:
                 # 首次跨过阈值：激活拉黑
                 conn.execute(
                     "UPDATE fakeid_blacklist SET verification_count=?, is_active=1, "
-                    "blacklisted_at=?, note=? WHERE fakeid=?",
+                    "blacklisted_at=?, note=? WHERE user_id=? AND fakeid=?",
                     (new_count, int(time.time()),
                      f"自动记录: 触发验证码 {new_count} 次（达到阈值 {threshold}）",
-                     fakeid),
+                     user_id, fakeid),
                 )
             else:
                 # 仅累计计数，不动 is_active（保留 admin 手动取消的状态）
                 conn.execute(
-                    "UPDATE fakeid_blacklist SET verification_count=? WHERE fakeid=?",
-                    (new_count, fakeid),
+                    "UPDATE fakeid_blacklist SET verification_count=? WHERE user_id=? AND fakeid=?",
+                    (new_count, user_id, fakeid),
                 )
         else:
             new_count = 1
             conn.execute(
                 "INSERT INTO fakeid_blacklist "
-                "(fakeid, nickname, reason, verification_count, is_active, blacklisted_at, note) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (fakeid, nickname, "high_verification", new_count,
+                "(user_id, fakeid, nickname, reason, verification_count, is_active, blacklisted_at, note) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (user_id, fakeid, nickname, "high_verification", new_count,
                  1 if new_count >= threshold else 0,
                  int(time.time()),
                  f"自动记录: 触发验证码 {new_count} 次"),
@@ -589,18 +750,18 @@ def increment_verification_count(fakeid: str, nickname: str = "") -> int:
 
 # ── 分类管理 ─────────────────────────────────────────────
 
-def create_category(name: str, description: str = "", color: str = "blue") -> Optional[int]:
+def create_category(name: str, description: str = "", color: str = "blue", user_id: int = 0) -> Optional[int]:
     """创建分类，返回新分类 ID"""
     conn = _get_conn()
     try:
         # 获取最大 sort_order
-        row = conn.execute("SELECT MAX(sort_order) as max_order FROM categories").fetchone()
+        row = conn.execute("SELECT MAX(sort_order) as max_order FROM categories WHERE user_id=?", (user_id,)).fetchone()
         max_order = row["max_order"] or 0
         
         cursor = conn.execute(
-            "INSERT INTO categories (name, description, color, sort_order, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (name, description, color, max_order + 1, int(time.time())),
+            "INSERT INTO categories (user_id, name, description, color, sort_order, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (user_id, name, description, color, max_order + 1, int(time.time())),
         )
         conn.commit()
         return cursor.lastrowid
@@ -611,7 +772,7 @@ def create_category(name: str, description: str = "", color: str = "blue") -> Op
 
 
 def update_category(category_id: int, name: str = None, 
-                    description: str = None, color: str = None) -> bool:
+                    description: str = None, color: str = None, user_id: int = 0) -> bool:
     """更新分类"""
     conn = _get_conn()
     try:
@@ -630,9 +791,9 @@ def update_category(category_id: int, name: str = None,
         if not updates:
             return False
         
-        params.append(category_id)
+        params.extend([category_id, user_id])
         conn.execute(
-            f"UPDATE categories SET {', '.join(updates)} WHERE id=?",
+            f"UPDATE categories SET {', '.join(updates)} WHERE id=? AND user_id=?",
             params,
         )
         conn.commit()
@@ -641,51 +802,52 @@ def update_category(category_id: int, name: str = None,
         conn.close()
 
 
-def delete_category(category_id: int) -> bool:
+def delete_category(category_id: int, user_id: int = 0) -> bool:
     """删除分类（订阅会自动解除关联）"""
     conn = _get_conn()
     try:
-        conn.execute("DELETE FROM categories WHERE id=?", (category_id,))
+        conn.execute("DELETE FROM categories WHERE id=? AND user_id=?", (category_id, user_id))
         conn.commit()
         return conn.total_changes > 0
     finally:
         conn.close()
 
 
-def list_categories() -> List[Dict]:
+def list_categories(user_id: int = 0) -> List[Dict]:
     """获取所有分类及其订阅数"""
     conn = _get_conn()
     try:
         rows = conn.execute("""
             SELECT c.*, 
-                   (SELECT COUNT(*) FROM subscriptions s WHERE s.category_id=c.id) AS subscription_count
+                   (SELECT COUNT(*) FROM subscriptions s WHERE s.user_id=c.user_id AND s.category_id=c.id) AS subscription_count
             FROM categories c 
+            WHERE c.user_id=?
             ORDER BY c.sort_order, c.created_at
-        """).fetchall()
+        """, (user_id,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_category(category_id: int) -> Optional[Dict]:
+def get_category(category_id: int, user_id: int = 0) -> Optional[Dict]:
     """获取单个分类"""
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT * FROM categories WHERE id=?", (category_id,)
+            "SELECT * FROM categories WHERE id=? AND user_id=?", (category_id, user_id)
         ).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
 
 
-def set_subscription_category(fakeid: str, category_id: Optional[int]) -> bool:
+def set_subscription_category(fakeid: str, category_id: Optional[int], user_id: int = 0) -> bool:
     """设置订阅的分类"""
     conn = _get_conn()
     try:
         conn.execute(
-            "UPDATE subscriptions SET category_id=? WHERE fakeid=?",
-            (category_id, fakeid),
+            "UPDATE subscriptions SET category_id=? WHERE user_id=? AND fakeid=?",
+            (category_id, user_id, fakeid),
         )
         conn.commit()
         return conn.total_changes > 0
@@ -693,22 +855,22 @@ def set_subscription_category(fakeid: str, category_id: Optional[int]) -> bool:
         conn.close()
 
 
-def get_subscriptions_by_category(category_id: int) -> List[Dict]:
+def get_subscriptions_by_category(category_id: int, user_id: int = 0) -> List[Dict]:
     """获取分类下的所有订阅"""
     conn = _get_conn()
     try:
         rows = conn.execute(
             "SELECT s.*, "
-            "(SELECT COUNT(*) FROM articles a WHERE a.fakeid=s.fakeid) AS article_count "
-            "FROM subscriptions s WHERE s.category_id=? ORDER BY s.created_at DESC",
-            (category_id,),
+            "(SELECT COUNT(*) FROM articles a WHERE a.user_id=s.user_id AND a.fakeid=s.fakeid) AS article_count "
+            "FROM subscriptions s WHERE s.user_id=? AND s.category_id=? ORDER BY s.created_at DESC",
+            (user_id, category_id),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_articles_by_category(category_id: int, limit: int = 50) -> List[Dict]:
+def get_articles_by_category(category_id: int, limit: int = 50, user_id: int = 0) -> List[Dict]:
     """
     获取分类下所有订阅的常规文章
     只返回轮询器拉取的文章（source='poll'），不包含历史文章
@@ -719,8 +881,8 @@ def get_articles_by_category(category_id: int, limit: int = 50) -> List[Dict]:
     try:
         # 获取该分类下的所有fakeid
         subs = conn.execute(
-            "SELECT fakeid FROM subscriptions WHERE category_id=?",
-            (category_id,)
+            "SELECT fakeid FROM subscriptions WHERE user_id=? AND category_id=?",
+            (user_id, category_id)
         ).fetchall()
         if not subs:
             return []
@@ -747,14 +909,14 @@ def get_articles_by_category(category_id: int, limit: int = 50) -> List[Dict]:
                         ORDER BY publish_time DESC
                     ) AS rn
                 FROM articles
-                WHERE fakeid IN ({placeholders}) AND source='poll'
+                WHERE user_id=? AND fakeid IN ({placeholders}) AND source='poll'
             )
             SELECT * FROM ranked_articles
             WHERE rn <= ?
             ORDER BY publish_time DESC
             LIMIT ?
             """,
-            (*fakeid_list, per_sub_limit, total_limit),
+            (user_id, *fakeid_list, per_sub_limit, total_limit),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:

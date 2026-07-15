@@ -10,10 +10,11 @@
 
 import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from utils.auth_manager import auth_manager
+from utils.app_auth import require_user
 from utils import rss_store
 
 router = APIRouter()
@@ -34,15 +35,15 @@ class StatusResponse(BaseModel):
 
 
 @router.get("/status", response_model=StatusResponse, summary="获取登录状态")
-async def get_status():
+async def get_status(user=Depends(require_user)):
     """获取当前登录状态"""
-    return auth_manager.get_status()
+    return auth_manager.get_status(user_id=user["id"])
 
 
 @router.post("/logout", summary="退出登录")
-async def logout():
+async def logout(user=Depends(require_user)):
     """退出登录，清除凭证"""
-    success = auth_manager.clear_credentials()
+    success = auth_manager.clear_credentials(user_id=user["id"])
     if success:
         return {"success": True, "message": "已退出登录"}
     else:
@@ -71,9 +72,9 @@ class AddBlacklistRequest(BaseModel):
 
 
 @router.get("/blacklist", summary="获取黑名单列表")
-async def get_blacklist():
+async def get_blacklist(user=Depends(require_user)):
     """获取公众号黑名单列表"""
-    blacklist = rss_store.get_blacklist()
+    blacklist = rss_store.get_blacklist(user_id=user["id"])
     return {
         "blacklist": [
             BlacklistItem(
@@ -93,13 +94,14 @@ async def get_blacklist():
 
 
 @router.post("/blacklist", summary="添加到黑名单")
-async def add_to_blacklist(req: AddBlacklistRequest):
+async def add_to_blacklist(req: AddBlacklistRequest, user=Depends(require_user)):
     """手动添加公众号到黑名单"""
     success = rss_store.add_to_blacklist(
         fakeid=req.fakeid,
         nickname=req.nickname,
         reason=req.reason,
-        note=req.note or "手动添加"
+        note=req.note or "手动添加",
+        user_id=user["id"]
     )
     if success:
         return {"success": True, "message": f"已将 {req.nickname or req.fakeid} 加入黑名单"}
@@ -107,18 +109,18 @@ async def add_to_blacklist(req: AddBlacklistRequest):
 
 
 @router.delete("/blacklist/{fakeid}", summary="从黑名单移除")
-async def remove_from_blacklist(fakeid: str):
+async def remove_from_blacklist(fakeid: str, user=Depends(require_user)):
     """从黑名单移除公众号（标记为非活跃）"""
-    success = rss_store.remove_from_blacklist(fakeid)
+    success = rss_store.remove_from_blacklist(fakeid, user_id=user["id"])
     if success:
         return {"success": True, "message": "已从黑名单移除"}
     return {"success": False, "message": "移除失败，记录不存在"}
 
 
 @router.delete("/blacklist/record/{blacklist_id}", summary="永久删除黑名单记录")
-async def delete_blacklist_record(blacklist_id: int):
+async def delete_blacklist_record(blacklist_id: int, user=Depends(require_user)):
     """永久删除黑名单记录（仅可删除非活跃记录）"""
-    success = rss_store.delete_blacklist_record(blacklist_id)
+    success = rss_store.delete_blacklist_record(blacklist_id, user_id=user["id"])
     if success:
         return {"success": True, "message": "记录已删除"}
     return {"success": False, "message": "删除失败，记录不存在或仍在生效中"}
@@ -153,9 +155,9 @@ class SetCategoryRequest(BaseModel):
 
 
 @router.get("/categories", summary="获取分类列表")
-async def get_categories():
+async def get_categories(user=Depends(require_user)):
     """获取所有分类"""
-    categories = rss_store.list_categories()
+    categories = rss_store.list_categories(user_id=user["id"])
     return {
         "categories": [
             CategoryItem(
@@ -173,12 +175,13 @@ async def get_categories():
 
 
 @router.post("/categories", summary="创建分类")
-async def create_category(req: CreateCategoryRequest):
+async def create_category(req: CreateCategoryRequest, user=Depends(require_user)):
     """创建新分类"""
     category_id = rss_store.create_category(
         name=req.name,
         description=req.description,
-        color=req.color
+        color=req.color,
+        user_id=user["id"]
     )
     if category_id:
         return {"success": True, "id": category_id, "message": f"分类 '{req.name}' 创建成功"}
@@ -186,13 +189,14 @@ async def create_category(req: CreateCategoryRequest):
 
 
 @router.patch("/categories/{category_id}", summary="更新分类")
-async def update_category(category_id: int, req: UpdateCategoryRequest):
+async def update_category(category_id: int, req: UpdateCategoryRequest, user=Depends(require_user)):
     """更新分类信息"""
     success = rss_store.update_category(
         category_id=category_id,
         name=req.name,
         description=req.description,
-        color=req.color
+        color=req.color,
+        user_id=user["id"]
     )
     if success:
         return {"success": True, "message": "分类已更新"}
@@ -200,22 +204,22 @@ async def update_category(category_id: int, req: UpdateCategoryRequest):
 
 
 @router.delete("/categories/{category_id}", summary="删除分类")
-async def delete_category(category_id: int):
+async def delete_category(category_id: int, user=Depends(require_user)):
     """删除分类（订阅会自动解除关联）"""
-    success = rss_store.delete_category(category_id)
+    success = rss_store.delete_category(category_id, user_id=user["id"])
     if success:
         return {"success": True, "message": "分类已删除"}
     raise HTTPException(status_code=404, detail="分类不存在")
 
 
 @router.get("/categories/{category_id}/subscriptions", summary="获取分类下的订阅")
-async def get_category_subscriptions(category_id: int):
+async def get_category_subscriptions(category_id: int, user=Depends(require_user)):
     """获取分类下的所有订阅"""
-    category = rss_store.get_category(category_id)
+    category = rss_store.get_category(category_id, user_id=user["id"])
     if not category:
         raise HTTPException(status_code=404, detail="分类不存在")
     
-    subscriptions = rss_store.get_subscriptions_by_category(category_id)
+    subscriptions = rss_store.get_subscriptions_by_category(category_id, user_id=user["id"])
     return {
         "category": CategoryItem(
             id=category["id"],
@@ -231,7 +235,7 @@ async def get_category_subscriptions(category_id: int):
 
 
 @router.put("/subscriptions/{fakeid}/category", summary="设置订阅分类")
-async def set_subscription_category(fakeid: str, req: SetCategoryRequest):
+async def set_subscription_category(fakeid: str, req: SetCategoryRequest, user=Depends(require_user)):
     """设置订阅的分类"""
     # 如果指定了分类，验证分类存在
     if req.category_id is not None:
@@ -239,7 +243,7 @@ async def set_subscription_category(fakeid: str, req: SetCategoryRequest):
         if not category:
             raise HTTPException(status_code=404, detail="分类不存在")
     
-    success = rss_store.set_subscription_category(fakeid, req.category_id)
+    success = rss_store.set_subscription_category(fakeid, req.category_id, user_id=user["id"])
     if success:
         return {"success": True, "message": "分类已设置"}
     raise HTTPException(status_code=404, detail="订阅不存在")
@@ -260,7 +264,7 @@ class FetchHistoryResponse(BaseModel):
 
 
 @router.post("/history/fetch", response_model=FetchHistoryResponse, summary="获取历史文章")
-async def fetch_history_articles(req: FetchHistoryRequest):
+async def fetch_history_articles(req: FetchHistoryRequest, user=Depends(require_user)):
     """
     获取公众号的历史文章并存入数据库。
     简化版：直接调用微信 API 获取历史文章列表，不涉及用户权限和付费逻辑。
@@ -268,7 +272,7 @@ async def fetch_history_articles(req: FetchHistoryRequest):
     from utils.auth_manager import auth_manager
     
     # 检查登录状态
-    status = auth_manager.get_status()
+    status = auth_manager.get_status(user_id=user["id"])
     if not status.get("authenticated"):
         return FetchHistoryResponse(
             success=False,
@@ -278,7 +282,7 @@ async def fetch_history_articles(req: FetchHistoryRequest):
         )
     
     # 检查订阅是否存在
-    subscriptions = rss_store.list_subscriptions()
+    subscriptions = rss_store.list_subscriptions(user_id=user["id"])
     sub = next((s for s in subscriptions if s["fakeid"] == req.fakeid), None)
     if not sub:
         return FetchHistoryResponse(
@@ -292,7 +296,8 @@ async def fetch_history_articles(req: FetchHistoryRequest):
         # 调用 poller 的内部方法获取文章列表
         fetched_count, new_count = await _fetch_history_internal(
             fakeid=req.fakeid,
-            target_count=req.count
+            target_count=req.count,
+            user_id=user["id"]
         )
         
         return FetchHistoryResponse(
@@ -310,7 +315,7 @@ async def fetch_history_articles(req: FetchHistoryRequest):
         )
 
 
-async def _fetch_history_internal(fakeid: str, target_count: int) -> tuple:
+async def _fetch_history_internal(fakeid: str, target_count: int, user_id: int = 0) -> tuple:
     """
     内部历史文章获取逻辑。
     
@@ -332,17 +337,17 @@ async def _fetch_history_internal(fakeid: str, target_count: int) -> tuple:
     import asyncio
     import random
     
-    creds = auth_manager.get_credentials()
+    creds = auth_manager.get_credentials(user_id=user_id)
     if not creds or not creds.get("token"):
         raise ValueError("登录凭证无效")
     
     # 验证订阅是否存在
-    sub = rss_store.get_subscription(fakeid)
+    sub = rss_store.get_subscription(fakeid, user_id=user_id)
     if not sub:
         raise ValueError("订阅不存在")
     
     # 获取数据库中已有的历史文章数量（source='deep_fetch'），从这个位置开始翻页
-    existing_historical = rss_store.count_historical_articles(fakeid)
+    existing_historical = rss_store.count_historical_articles(fakeid, user_id=user_id)
     
     historical_articles = []
     batch_size = 10
@@ -446,6 +451,6 @@ async def _fetch_history_internal(fakeid: str, target_count: int) -> tuple:
     historical_articles = historical_articles[:target_count]
     
     # 保存到数据库（去重），标记为历史文章 'deep_fetch'
-    new_count = rss_store.save_articles(fakeid, historical_articles, source='deep_fetch')
+    new_count = rss_store.save_articles(fakeid, historical_articles, source='deep_fetch', user_id=user_id)
     
     return len(historical_articles), new_count

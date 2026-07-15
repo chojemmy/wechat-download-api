@@ -9,13 +9,14 @@
 实现真实的微信公众号登录流程
 """
 
-from fastapi import APIRouter, HTTPException, Response, Request
+from fastapi import APIRouter, Depends, HTTPException, Response, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict
 import httpx
 import time
 from utils.auth_manager import auth_manager
+from utils.app_auth import require_user
 from utils.webhook import webhook
 
 router = APIRouter()
@@ -338,7 +339,7 @@ async def check_scan_status(request: Request):
         raise HTTPException(status_code=500, detail=f"检查扫码状态失败: {str(e)}")
 
 @router.post("/bizlogin", summary="完成登录", include_in_schema=True)
-async def biz_login(request: Request):
+async def biz_login(request: Request, user=Depends(require_user)):
     """
     扫码确认后调用此接口完成登录，成功后凭证自动保存到 `.env`。
 
@@ -506,7 +507,8 @@ async def biz_login(request: Request):
             cookie=cookie_str,
             fakeid=fakeid,
             nickname=nickname,
-            expire_time=expire_time
+            expire_time=expire_time,
+            user_id=user["id"]
         )
         
         print(f"[OK] 登录成功: {nickname} (fakeid: {fakeid})")
@@ -541,7 +543,7 @@ async def biz_login(request: Request):
         )
 
 @router.post("/manual", response_model=LoginResponse, summary="手动配置登录凭证")
-async def manual_login(request: LoginRequest):
+async def manual_login(request: LoginRequest, user=Depends(require_user)):
     """
     手动提交登录凭证（适用于已通过其他方式获取凭证的场景）。
 
@@ -558,7 +560,8 @@ async def manual_login(request: LoginRequest):
             cookie=request.cookie,
             fakeid=request.fakeid,
             nickname=request.nickname,
-            expire_time=request.expire_time
+            expire_time=request.expire_time,
+            user_id=user["id"]
         )
         
         if success:
@@ -579,11 +582,11 @@ async def manual_login(request: LoginRequest):
         raise HTTPException(status_code=500, detail=f"保存失败: {str(e)}")
 
 @router.get("/info", summary="获取登录信息")
-async def get_login_info():
+async def get_login_info(user=Depends(require_user)):
     """
     获取当前登录用户的昵称、FakeID、过期时间等信息。
     """
-    credentials = auth_manager.get_credentials()
+    credentials = auth_manager.get_credentials(user_id=user["id"])
     if credentials:
         return {
             "success": True,

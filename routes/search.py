@@ -9,13 +9,14 @@
 """
 
 import os
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 from typing import Optional, List
 import time
 import httpx
 import json
 from utils.auth_manager import auth_manager
+from utils.app_auth import require_user
 from utils.image_proxy import proxy_image_url
 from utils.wechat_status import is_login_expired, LOGIN_EXPIRED_MSG
 
@@ -48,10 +49,10 @@ class SearchResponse(BaseModel):
     data: Optional[dict] = None
     error: Optional[str] = None
 
-async def searchbiz_raw(query: str, base_url: str = ""):
+async def searchbiz_raw(query: str, base_url: str = "", user_id: int = 0):
     """调用微信 searchbiz，返回 (过滤黑名单后的公众号列表, 错误信息)。
     成功时 error=None；失败时 list 空、error 为提示。供 /searchbiz 与批量订阅复用。"""
-    credentials = auth_manager.get_credentials()
+    credentials = auth_manager.get_credentials(user_id=user_id)
     if not credentials:
         return [], "服务器未登录，请先访问管理页面扫码登录"
 
@@ -84,7 +85,7 @@ async def searchbiz_raw(query: str, base_url: str = ""):
             accounts = result.get("list", [])
             # [2026-05-18] 过滤已知失效号（黑名单）：避免搜到老 fakeid 订阅后拉不到内容
             from utils import rss_store
-            blacklisted = set(rss_store.get_active_blacklist_fakeids())
+            blacklisted = set(rss_store.get_active_blacklist_fakeids(user_id=user_id))
             out = []
             for acc in accounts:
                 fid = acc.get("fakeid", "")
@@ -115,7 +116,7 @@ async def searchbiz_raw(query: str, base_url: str = ""):
 
 
 @router.get("/searchbiz", response_model=SearchResponse, summary="搜索公众号")
-async def search_accounts(query: str = Query(..., description="公众号名称或关键词", alias="query"), request: Request = None):
+async def search_accounts(query: str = Query(..., description="公众号名称或关键词", alias="query"), request: Request = None, user=Depends(require_user)):
     """
     按关键词搜索微信公众号，获取 FakeID。
 
@@ -127,7 +128,7 @@ async def search_accounts(query: str = Query(..., description="公众号名称�
     - `total`: 匹配数量（已过滤黑名单）
     """
     base_url = get_base_url(request) if request else ""
-    accounts, err = await searchbiz_raw(query, base_url)
+    accounts, err = await searchbiz_raw(query, base_url, user_id=user["id"])
     if err:
         return SearchResponse(success=False, error=err)
     return SearchResponse(success=True, data={"list": accounts, "total": len(accounts)})

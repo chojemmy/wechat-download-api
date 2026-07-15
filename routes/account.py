@@ -9,11 +9,12 @@
 获取公众号的主体信息、认证信息等
 """
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict
 import httpx
 from utils.auth_manager import auth_manager
+from utils.app_auth import require_user
 from utils.wechat_status import is_login_expired, LOGIN_EXPIRED_MSG
 
 router = APIRouter()
@@ -28,7 +29,8 @@ class AccountInfoResponse(BaseModel):
 
 @router.get("/accountinfo", response_model=AccountInfoResponse, summary="获取公众号主体信息")
 async def get_account_info(
-    fakeid: str = Query(..., description="公众号的 FakeID（通过搜索接口获取）")
+    fakeid: str = Query(..., description="公众号的 FakeID（通过搜索接口获取）"),
+    user=Depends(require_user)
 ):
     """
     获取指定公众号的主体信息（认证主体、原创文章数等）。
@@ -47,7 +49,7 @@ async def get_account_info(
     - `original_article_count`: 原创文章数量
     """
     # 获取认证信息（用于请求微信API）
-    credentials = auth_manager.get_credentials()
+    credentials = auth_manager.get_credentials(user_id=user["id"])
     if not credentials:
         return AccountInfoResponse(
             success=False,

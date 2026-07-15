@@ -25,8 +25,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
 # 导入路由
-from routes import article, articles, search, admin, login, image, health, stats, rss, account, feed
+from routes import article, articles, search, admin, login, image, health, stats, rss, account, feed, users
 from utils.rss_store import init_db
+from utils.user_store import init_user_db
 from utils.rss_poller import rss_poller
 
 API_DESCRIPTION = """
@@ -62,6 +63,7 @@ async def lifespan(app: FastAPI):
         print("=" * 60 + "\n")
 
     init_db()
+    init_user_db()
     await rss_poller.start()
     
     # 启动登录过期提醒器（自动检测凭证有效期并 webhook 通知）
@@ -132,7 +134,8 @@ app.include_router(articles.router, prefix="/api/public", tags=["文章列表"])
 app.include_router(search.router, prefix="/api/public", tags=["公众号搜索"])  # 后注册
 app.include_router(account.router, prefix="/api/public", tags=["公众号信息"])
 app.include_router(admin.router, prefix="/api/admin", tags=["管理"])
-app.include_router(login.router, prefix="/api/login", tags=["登录"])
+app.include_router(login.router, prefix="/api/login", tags=["微信登录"])
+app.include_router(users.router, prefix="/api/users", tags=["应用用户"])
 app.include_router(image.router, prefix="/api", tags=["图片代理"])
 app.include_router(rss.router, prefix="/api", tags=["RSS 订阅"])
 app.include_router(feed.router, prefix="/api", tags=["Feed（文章列表 / markdown 导出）"])
@@ -201,6 +204,11 @@ async def redoc_html():
 async def root():
     """首页 - 重定向到管理页面"""
     return FileResponse(static_dir / "admin.html")
+
+@app.get("/user-login.html", include_in_schema=False)
+async def user_login_page():
+    """应用账号登录页面"""
+    return FileResponse(static_dir / "user-login.html")
 
 @app.get("/admin.html", include_in_schema=False)
 async def admin_page():

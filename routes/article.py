@@ -12,10 +12,11 @@ import logging
 import re
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from utils.auth_manager import auth_manager
+from utils.app_auth import require_user
 from utils.helpers import extract_article_info, parse_article_url, is_image_text_message, has_article_content, get_client_ip
 from utils.rate_limiter import rate_limiter
 from utils.webhook import webhook
@@ -46,7 +47,7 @@ class ArticleResponse(BaseModel):
     error: Optional[str] = Field(None, description="错误信息，成功时为 null")
 
 @router.post("/article", response_model=ArticleResponse, summary="获取文章内容")
-async def get_article(article_request: ArticleRequest, request: Request):
+async def get_article(article_request: ArticleRequest, request: Request, user=Depends(require_user)):
     """
     解析微信公众号文章，返回标题、正文、图片等结构化数据。
 
@@ -66,7 +67,7 @@ async def get_article(article_request: ArticleRequest, request: Request):
     if not allowed:
         return {"success": False, "error": f"Rate limited: {error_msg}"}
 
-    credentials = auth_manager.get_credentials()
+    credentials = auth_manager.get_credentials(user_id=user["id"])
     if not credentials:
         return {"success": False, "error": "服务器未登录，请先访问管理页面扫码登录"}
 

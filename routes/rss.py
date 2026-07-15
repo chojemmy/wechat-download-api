@@ -19,11 +19,12 @@ from html import escape as html_escape
 from typing import Optional
 import xml.etree.ElementTree as ET
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from utils import rss_store
+from utils.app_auth import require_feed_user, require_user
 from utils.rss_poller import rss_poller, POLL_INTERVAL
 from utils.image_proxy import proxy_image_url
 from utils.rss_streaming import (
@@ -112,7 +113,7 @@ class PollerStatusResponse(BaseModel):
 # ── 订阅管理 ─────────────────────────────────────────────
 
 @router.post("/rss/subscribe", response_model=SubscribeResponse, summary="添加 RSS 订阅")
-async def subscribe(req: SubscribeRequest, request: Request):
+async def subscribe(req: SubscribeRequest, request: Request, user=Depends(require_user)):
     """
     添加一个公众号到 RSS 订阅列表。
 
@@ -129,6 +130,7 @@ async def subscribe(req: SubscribeRequest, request: Request):
         nickname=req.nickname,
         alias=req.alias,
         head_img=req.head_img,
+        user_id=user["id"],
     )
     if added:
         logger.info("RSS subscription added: %s (%s)", req.nickname, req.fakeid[:8])
@@ -141,7 +143,7 @@ class BatchSubscribeRequest(BaseModel):
 
 
 @router.post("/rss/batch-subscribe", summary="批量订阅（多个公众号名称）")
-async def batch_subscribe(req: BatchSubscribeRequest, request: Request):
+async def batch_subscribe(req: BatchSubscribeRequest, request: Request, user=Depends(require_user)):
     """
     粘一批公众号名称（每行一个）→ 逐个搜索并订阅。
 
@@ -159,11 +161,11 @@ async def batch_subscribe(req: BatchSubscribeRequest, request: Request):
     if not lines:
         raise HTTPException(status_code=400, detail="请输入至少一个公众号名称")
 
-    subscribed_fakeids = {s["fakeid"] for s in rss_store.list_subscriptions()}
+    subscribed_fakeids = {s["fakeid"] for s in rss_store.list_subscriptions(user_id=user["id"])}
     subscribed, needs_confirm, failed = [], [], []
 
     for i, line in enumerate(lines):
-        cands, err = await searchbiz_raw(line, base_url)
+        cands, err = await searchbiz_raw(line, base_url, user_id=user["id"])
         if err:
             failed.append({"input": line, "reason": err})
         elif not cands:
@@ -173,7 +175,7 @@ async def batch_subscribe(req: BatchSubscribeRequest, request: Request):
             if c["fakeid"] in subscribed_fakeids:
                 failed.append({"input": line, "reason": f"已订阅「{c['nickname'] or c['fakeid']}」"})
             else:
-                rss_store.add_subscription(c["fakeid"], c["nickname"], c["alias"], c["round_head_img"])
+                rss_store.add_subscription(c["fakeid"], c["nickname"], c["alias"], c["round_head_img"], user_id=user["id"])
                 subscribed_fakeids.add(c["fakeid"])
                 subscribed.append({"input": line, "nickname": c["nickname"] or c["fakeid"]})
         else:
@@ -195,14 +197,14 @@ async def batch_subscribe(req: BatchSubscribeRequest, request: Request):
 
 @router.delete("/rss/subscribe/{fakeid}", response_model=SubscribeResponse,
                summary="取消 RSS 订阅")
-async def unsubscribe(fakeid: str):
+async def unsubscribe(fakeid: str, user=Depends(require_user)):
     """
     取消订阅一个公众号，同时删除该公众号的缓存文章。
 
     **路径参数：**
     - **fakeid**: 公众号 FakeID
     """
-    removed = rss_store.remove_subscription(fakeid)
+    removed = rss_store.remove_subscription(fakeid, user_id=user["id"])
     if removed:
         logger.info("RSS subscription removed: %s", fakeid[:8])
         return SubscribeResponse(success=True, message="已取消订阅")
@@ -211,13 +213,13 @@ async def unsubscribe(fakeid: str):
 
 @router.get("/rss/subscriptions", response_model=SubscriptionListResponse,
             summary="获取订阅列表")
-async def get_subscriptions(request: Request):
+async def get_subscriptions(request: Request, user=Depends(require_user)):
     """
     获取当前所有 RSS 订阅的公众号列表。
 
     返回每个订阅的基本信息、缓存文章数和 RSS 地址。
     """
-    subs = rss_store.list_subscriptions()
+    subs = rss_store.list_subscriptions(user_id=user["id"])
     base_url = get_base_url(request)
 
     items = []
@@ -226,12 +228,12 @@ async def get_subscriptions(request: Request):
         head_img = proxy_image_url(s.get("head_img", ""), base_url)
         fakeid = s['fakeid']
         # 统计历史文章数量
-        historical_count = rss_store.count_historical_articles(fakeid)
+        historical_count = rss_store.count_historical_articles(fakeid, user_id=user["id"])
         items.append({
             **s,
             "head_img": head_img,
-            "rss_url": f"{base_url}/api/rss/{fakeid}",
-            "historical_rss_url": f"{base_url}/api/rss/{fakeid}/history" if historical_count > 0 else "",
+            "rss_url": f"{base_url}/api/rss/{fakeid}?feed_token={user.get('feed_token', '')}",
+            "historical_rss_url": f"{base_url}/api/rss/{fakeid}/history?feed_token={user.get('feed_token', '')}" if historical_count > 0 else "",
             "historical_count": historical_count,
         })
 
@@ -240,7 +242,7 @@ async def get_subscriptions(request: Request):
 
 @router.post("/rss/poll", response_model=PollerStatusResponse,
              summary="手动触发轮询")
-async def trigger_poll():
+async def trigger_poll(user=Depends(require_user)):
     """
     手动触发一次轮询，立即拉取所有订阅公众号的最新文章。
 
@@ -252,7 +254,7 @@ async def trigger_poll():
             data={"message": "轮询器未启动"}
         )
     try:
-        await rss_poller.poll_now()
+        await rss_poller.poll_now(user_id=user["id"])
         return PollerStatusResponse(
             success=True,
             data={"message": "轮询完成"}
@@ -266,11 +268,11 @@ async def trigger_poll():
 
 @router.get("/rss/status", response_model=PollerStatusResponse,
             summary="轮询器状态")
-async def poller_status():
+async def poller_status(user=Depends(require_user)):
     """
     获取 RSS 轮询器运行状态。
     """
-    subs = rss_store.list_subscriptions()
+    subs = rss_store.list_subscriptions(user_id=user["id"])
     return PollerStatusResponse(
         success=True,
         data={
@@ -288,6 +290,7 @@ async def poller_status():
 async def get_aggregated_rss_feed(
     request: Request,
     limit: int = Query(RSS_AGGREGATED_DEFAULT, ge=1, le=RSS_AGGREGATED_MAX, description="文章数量上限"),
+    user=Depends(require_feed_user),
 ):
     """
     获取所有订阅公众号的聚合 RSS 2.0 订阅源。
@@ -295,10 +298,10 @@ async def get_aggregated_rss_feed(
     将此地址添加到 RSS 阅读器，即可在一个订阅源中查看所有公众号文章。
     订阅增减后自动生效，无需更换链接。
     """
-    subs = rss_store.list_subscriptions()
+    subs = rss_store.list_subscriptions(user_id=user["id"])
     nickname_map = {s["fakeid"]: s.get("nickname") or s["fakeid"] for s in subs}
 
-    articles = rss_store.get_all_articles(limit=limit) if subs else []
+    articles = rss_store.get_all_articles(limit=limit, user_id=user["id"]) if subs else []
 
     base_url = get_base_url(request)
     
@@ -316,6 +319,7 @@ async def get_aggregated_rss_feed(
 async def export_subscriptions(
     request: Request,
     format: str = Query("csv", regex="^(csv|opml)$", description="导出格式: csv 或 opml"),
+    user=Depends(require_user),
 ):
     """
     导出当前订阅列表。
@@ -323,7 +327,9 @@ async def export_subscriptions(
     - **csv**: 包含公众号名称、FakeID、RSS 地址、文章数、订阅时间
     - **opml**: 标准 OPML 格式，可直接导入 RSS 阅读器
     """
-    subs = rss_store.list_subscriptions()
+    subs = rss_store.list_subscriptions(user_id=user["id"])
+    for s in subs:
+        s["feed_token"] = user.get("feed_token", "")
     base_url = get_base_url(request)
 
     if format == "opml":
@@ -337,7 +343,7 @@ def _build_csv_response(subs: list, base_url: str) -> Response:
     writer = csv.writer(buf)
     writer.writerow(["Name", "FakeID", "RSS URL", "Articles", "Subscribed At"])
     for s in subs:
-        rss_url = f"{base_url}/api/rss/{s['fakeid']}"
+        rss_url = f"{base_url}/api/rss/{s['fakeid']}?feed_token={s.get('feed_token', '')}"
         sub_date = datetime.fromtimestamp(
             s.get("created_at", 0), tz=timezone.utc
         ).strftime("%Y-%m-%d")
@@ -368,7 +374,7 @@ def _build_opml_response(subs: list, base_url: str) -> Response:
 
     for s in subs:
         name = s.get("nickname") or s["fakeid"]
-        rss_url = f"{base_url}/api/rss/{s['fakeid']}"
+        rss_url = f"{base_url}/api/rss/{s['fakeid']}?feed_token={s.get('feed_token', '')}"
         ET.SubElement(group, "outline", **{
             "type": "rss",
             "text": name,
@@ -407,7 +413,8 @@ def _rfc822(ts: int) -> str:
             response_class=Response)
 async def get_rss_feed(fakeid: str, request: Request,
                        limit: int = Query(RSS_SINGLE_DEFAULT, ge=1, le=RSS_SINGLE_MAX,
-                                          description="文章数量上限")):
+                                          description="文章数量上限"),
+                       user=Depends(require_feed_user)):
     """
     获取指定公众号的 RSS 2.0 订阅源（XML 格式）。
 
@@ -421,11 +428,11 @@ async def get_rss_feed(fakeid: str, request: Request,
     **查询参数：**
     - **limit** (可选): 返回文章数量上限，默认 30，最大 50
     """
-    sub = rss_store.get_subscription(fakeid)
+    sub = rss_store.get_subscription(fakeid, user_id=user["id"])
     if not sub:
         raise HTTPException(status_code=404, detail="未找到该订阅，请先添加订阅")
 
-    articles = rss_store.get_regular_articles(fakeid, limit=limit)
+    articles = rss_store.get_regular_articles(fakeid, limit=limit, user_id=user["id"])
     base_url = get_base_url(request)
 
     return StreamingResponse(
@@ -443,6 +450,7 @@ async def get_historical_rss_feed(
     page: int = Query(1, ge=1, description="页码"),
     per_page: int = Query(RSS_HISTORICAL_DEFAULT, ge=10, le=RSS_HISTORICAL_MAX,
                           description="每页数量"),
+    user=Depends(require_feed_user),
 ):
     """
     获取指定公众号的历史文章 RSS 2.0 订阅源（XML 格式）。
@@ -461,11 +469,11 @@ async def get_historical_rss_feed(
     - **page** (可选): 页码，默认 1
     - **per_page** (可选): 每页数量，默认 500，最大 5000
     """
-    sub = rss_store.get_subscription(fakeid)
+    sub = rss_store.get_subscription(fakeid, user_id=user["id"])
     if not sub:
         raise HTTPException(status_code=404, detail="未找到该订阅，请先添加订阅")
 
-    total_count = rss_store.count_historical_articles(fakeid)
+    total_count = rss_store.count_historical_articles(fakeid, user_id=user["id"])
     if total_count == 0:
         raise HTTPException(
             status_code=404,
@@ -473,7 +481,7 @@ async def get_historical_rss_feed(
         )
 
     offset = (page - 1) * per_page
-    articles = rss_store.get_historical_articles(fakeid, limit=per_page, offset=offset)
+    articles = rss_store.get_historical_articles(fakeid, limit=per_page, offset=offset, user_id=user["id"])
 
     total_pages = (total_count + per_page - 1) // per_page
     base_url = get_base_url(request)
@@ -492,7 +500,8 @@ async def get_historical_rss_feed(
             response_class=Response)
 async def get_category_rss_feed(category_id: int, request: Request,
                                 limit: int = Query(RSS_CATEGORY_DEFAULT, ge=1, le=RSS_CATEGORY_MAX,
-                                                   description="文章数量上限")):
+                                                   description="文章数量上限"),
+                                user=Depends(require_feed_user)):
     """
     获取指定分类的 RSS 2.0 订阅源（XML 格式）。
 
@@ -504,14 +513,14 @@ async def get_category_rss_feed(category_id: int, request: Request,
     **查询参数：**
     - **limit** (可选): 返回文章数量上限
     """
-    category = rss_store.get_category(category_id)
+    category = rss_store.get_category(category_id, user_id=user["id"])
     if not category:
         raise HTTPException(status_code=404, detail="分类不存在")
 
-    subscriptions = rss_store.get_subscriptions_by_category(category_id)
+    subscriptions = rss_store.get_subscriptions_by_category(category_id, user_id=user["id"])
     nickname_map = {s["fakeid"]: s.get("nickname", s["fakeid"]) for s in subscriptions}
 
-    articles = rss_store.get_articles_by_category(category_id, limit=limit)
+    articles = rss_store.get_articles_by_category(category_id, limit=limit, user_id=user["id"])
 
     base_url = get_base_url(request)
 

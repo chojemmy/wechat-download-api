@@ -86,7 +86,7 @@ class AuthManager:
         }
     
     def save_credentials(self, token: str, cookie: str, fakeid: str, 
-                        nickname: str, expire_time: int) -> bool:
+                        nickname: str, expire_time: int, user_id: Optional[int] = None) -> bool:
         """
         保存凭证，支持双存储策略：
         1. 优先保存到 data/.credentials.json (Docker环境推荐，权限可靠)
@@ -102,6 +102,10 @@ class AuthManager:
         Returns:
             保存是否成功
         """
+        if user_id is not None:
+            from utils import user_store
+            return user_store.save_user_credentials(user_id, token, cookie, fakeid, nickname, expire_time)
+
         # 更新内存中的凭证
         self.credentials.update({
             "token": token,
@@ -151,13 +155,17 @@ class AuthManager:
         
         return True
     
-    def get_credentials(self) -> Optional[Dict[str, any]]:
+    def get_credentials(self, user_id: Optional[int] = None) -> Optional[Dict[str, any]]:
         """
         获取有效的凭证
         
         Returns:
             凭证字典，如果未登录则返回None
         """
+        if user_id is not None:
+            from utils import user_store
+            return user_store.get_user_credentials(user_id)
+
         # 重新加载以获取最新的凭证
         self._load_credentials()
         
@@ -166,27 +174,31 @@ class AuthManager:
         
         return self.credentials
     
-    def get_token(self) -> Optional[str]:
+    def get_token(self, user_id: Optional[int] = None) -> Optional[str]:
         """获取Token"""
-        creds = self.get_credentials()
+        creds = self.get_credentials(user_id=user_id)
         return creds["token"] if creds else None
     
-    def get_cookie(self) -> Optional[str]:
+    def get_cookie(self, user_id: Optional[int] = None) -> Optional[str]:
         """获取Cookie"""
-        creds = self.get_credentials()
+        creds = self.get_credentials(user_id=user_id)
         return creds["cookie"] if creds else None
     
-    def get_status(self) -> Dict:
+    def get_status(self, user_id: Optional[int] = None) -> Dict:
         """
         获取登录状态
         
         Returns:
             状态字典
         """
-        # 重新加载凭证
-        self._load_credentials()
+        if user_id is not None:
+            credentials = self.get_credentials(user_id=user_id) or {"token": "", "cookie": "", "fakeid": "", "nickname": "", "expire_time": 0}
+        else:
+            # 重新加载凭证
+            self._load_credentials()
+            credentials = self.credentials
         
-        if not self.credentials.get("token") or not self.credentials.get("cookie"):
+        if not credentials.get("token") or not credentials.get("cookie"):
             return {
                 "authenticated": False,
                 "loggedIn": False,
@@ -195,28 +207,32 @@ class AuthManager:
             }
         
         # 检查是否过期
-        expire_time = self.credentials.get("expire_time", 0)
+        expire_time = credentials.get("expire_time", 0)
         current_time = int(time.time() * 1000)  # 转换为毫秒
         is_expired = expire_time > 0 and current_time > expire_time
         
         return {
             "authenticated": True,
             "loggedIn": True,
-            "account": self.credentials.get("nickname", ""),
-            "nickname": self.credentials.get("nickname", ""),
-            "fakeid": self.credentials.get("fakeid", ""),
+            "account": credentials.get("nickname", ""),
+            "nickname": credentials.get("nickname", ""),
+            "fakeid": credentials.get("fakeid", ""),
             "expireTime": expire_time,
             "isExpired": is_expired,
             "status": "登录可能已过期，建议重新登录" if is_expired else "登录正常"
         }
     
-    def clear_credentials(self) -> bool:
+    def clear_credentials(self, user_id: Optional[int] = None) -> bool:
         """
         清除凭证（双存储都清除）
         
         Returns:
             清除是否成功
         """
+        if user_id is not None:
+            from utils import user_store
+            return user_store.clear_user_credentials(user_id)
+
         try:
             # 清除内存中的凭证
             self.credentials = {

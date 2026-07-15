@@ -9,12 +9,13 @@
 获取公众号的文章列表
 """
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import json
 import httpx
 from utils.auth_manager import auth_manager
+from utils.app_auth import require_user
 from utils.wechat_status import is_login_expired, is_invalid_fakeid, LOGIN_EXPIRED_MSG
 
 router = APIRouter()
@@ -44,7 +45,8 @@ async def get_articles(
     fakeid: str = Query(..., description="目标公众号的 FakeID（通过搜索接口获取）"),
     begin: int = Query(0, description="偏移量，从第几条开始", ge=0, alias="begin"),
     count: int = Query(10, description="获取数量，最大 100", ge=1, le=100),
-    keyword: Optional[str] = Query(None, description="在该公众号内搜索关键词（可选）")
+    keyword: Optional[str] = Query(None, description="在该公众号内搜索关键词（可选）"),
+    user=Depends(require_user)
 ):
     """
     获取指定公众号的文章列表，支持分页。
@@ -64,7 +66,7 @@ async def get_articles(
         print(f"[INFO] get article list: fakeid={fakeid[:8]}...")
         
         # 获取认证信息（用于请求微信API）
-        creds = auth_manager.get_credentials()
+        creds = auth_manager.get_credentials(user_id=user["id"])
         
         if not creds or not isinstance(creds, dict):
             raise HTTPException(

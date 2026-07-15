@@ -491,6 +491,7 @@
         }
 
         var categoriesCache = [];
+        var currentFeedToken = '';
 
         async function loadCategories() {
             try {
@@ -508,10 +509,12 @@
                 var res = await fetch('/api/rss/subscriptions');
                 var d = await res.json();
                 if (!d.success || !d.data || d.data.length === 0) {
+                    currentFeedToken = '';
                     el.innerHTML = '<div class="sub-empty">暂无订阅，搜索公众号后添加</div>';
                     updateAggRssBar(false);
                     return;
                 }
+                currentFeedToken = (d.data[0] && d.data[0].rss_url && d.data[0].rss_url.split('feed_token=')[1]) ? decodeURIComponent(d.data[0].rss_url.split('feed_token=')[1].split('&')[0]) : '';
                 updateAggRssBar(true);
                 var html = '<ul class="sub-list">';
                 d.data.forEach(function(s) {
@@ -762,7 +765,7 @@
         function updateAggRssBar(hasSubs) {
             var bar = document.getElementById('aggRssBar');
             if (hasSubs) {
-                var url = window.location.origin + '/api/rss/all';
+                var url = window.location.origin + '/api/rss/all?feed_token=' + encodeURIComponent(currentFeedToken || '');
                 document.getElementById('aggRssUrl').textContent = url;
                 bar.style.display = 'block';
             } else {

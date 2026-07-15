@@ -19,6 +19,7 @@ from typing import List, Dict, Optional
 import httpx
 
 from utils.auth_manager import auth_manager
+from utils import user_store
 from utils import rss_store
 from utils.helpers import extract_article_info, parse_article_url, is_image_text_message, has_article_content, is_article_unavailable, get_unavailable_reason
 from utils.http_client import fetch_page
@@ -96,51 +97,59 @@ class RSSPoller:
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _poll_all(self):
-        fakeids = rss_store.get_all_fakeids()
+        users = user_store.list_users_with_credentials()
+        if not users:
+            return
+        for user in users:
+            await self._poll_user(user["id"])
+
+    async def _poll_user(self, user_id: int):
+        fakeids = rss_store.get_all_fakeids(user_id=user_id)
         if not fakeids:
             return
 
-        creds = auth_manager.get_credentials()
+        creds = auth_manager.get_credentials(user_id=user_id)
         if not creds or not creds.get("token") or not creds.get("cookie"):
-            logger.warning("RSS poll skipped: not logged in")
+            logger.warning("RSS poll skipped for user %s: not logged in", user_id)
             return
 
         # 获取活跃黑名单
-        blacklisted = set(rss_store.get_active_blacklist_fakeids())
+        blacklisted = set(rss_store.get_active_blacklist_fakeids(user_id=user_id))
         
         # 过滤掉黑名单中的公众号
         active_fakeids = [f for f in fakeids if f not in blacklisted]
         skipped = len(fakeids) - len(active_fakeids)
         
         if skipped > 0:
-            logger.info("RSS poll: %d subscriptions (%d blacklisted, skipped)", 
-                       len(fakeids), skipped)
+            logger.info("RSS poll user=%s: %d subscriptions (%d blacklisted, skipped)",
+                       user_id, len(fakeids), skipped)
         else:
-            logger.info("RSS poll: checking %d subscriptions", len(fakeids))
+            logger.info("RSS poll user=%s: checking %d subscriptions", user_id, len(fakeids))
 
         for fakeid in active_fakeids:
             try:
                 articles = await self._fetch_article_list(fakeid, creds)
                 if articles and FETCH_FULL_CONTENT:
                     # 获取完整文章内容
-                    articles = await self._enrich_articles_content(fakeid, articles)
+                    articles = await self._enrich_articles_content(fakeid, articles, user_id=user_id)
 
                 if articles:
                     # 轮询器拉取的文章标记为 'poll'
-                    new_count = rss_store.save_articles(fakeid, articles, source='poll')
+                    new_count = rss_store.save_articles(fakeid, articles, source='poll', user_id=user_id)
                     if new_count > 0:
                         logger.info("RSS: %d new articles for %s", new_count, fakeid[:8])
-                rss_store.update_last_poll(fakeid)
+                rss_store.update_last_poll(fakeid, user_id=user_id)
             except WechatInvalidFakeidError as e:
                 # [2026-05-18] 同步 SaaS 修复：fakeid 在微信侧已失效，自动加入黑名单
                 # 取该 fakeid 的 nickname（如果数据库里有）便于后续运维查看
-                sub = rss_store.get_subscription(fakeid)
+                sub = rss_store.get_subscription(fakeid, user_id=user_id)
                 nickname = sub.get("nickname", "") if sub else ""
                 logger.warning("Fakeid %s (%s) is invalid on WeChat, adding to blacklist", fakeid[:8], nickname)
                 try:
                     rss_store.add_to_blacklist(
                         fakeid, nickname=nickname, reason="invalid_fakeid",
                         note="[2026-05-18] 微信侧返回 invalid args，fakeid 已失效（注销/改名/重新注册）",
+                        user_id=user_id,
                     )
                 except Exception as bl_err:
                     logger.warning("Failed to blacklist invalid fakeid %s: %s", fakeid[:8], bl_err)
@@ -237,11 +246,14 @@ class RSSPoller:
                 })
         return articles
 
-    async def poll_now(self):
+    async def poll_now(self, user_id: int = None):
         """手动触发一次轮询"""
-        await self._poll_all()
+        if user_id is None:
+            await self._poll_all()
+        else:
+            await self._poll_user(user_id)
     
-    async def _enrich_articles_content(self, fakeid: str, articles: List[Dict]) -> List[Dict]:
+    async def _enrich_articles_content(self, fakeid: str, articles: List[Dict], user_id: int = 0) -> List[Dict]:
         """
         批量获取文章完整内容（并发版）
         
@@ -273,8 +285,9 @@ class RSSPoller:
         logger.info("开始批量获取 %d 篇文章的完整内容", len(article_links))
         
         # 获取微信凭证（从环境变量读取）
-        wechat_token = os.getenv("WECHAT_TOKEN", "")
-        wechat_cookie = os.getenv("WECHAT_COOKIE", "")
+        creds = auth_manager.get_credentials(user_id=user_id) or {}
+        wechat_token = creds.get("token", "") or os.getenv("WECHAT_TOKEN", "")
+        wechat_cookie = creds.get("cookie", "") or os.getenv("WECHAT_COOKIE", "")
         
         results = await fetch_articles_batch(
             article_links, 
@@ -311,7 +324,7 @@ class RSSPoller:
                 or "环境异常" in html
             )
             if verification_markers:
-                sub = rss_store.get_subscription(fakeid)
+                sub = rss_store.get_subscription(fakeid, user_id=user_id)
                 nickname = sub.get("nickname", "") if sub else ""
                 count = rss_store.increment_verification_count(fakeid, nickname)
                 logger.warning("Verification triggered for %s (count=%d): %s",
