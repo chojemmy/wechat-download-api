@@ -307,7 +307,7 @@ async def get_aggregated_rss_feed(
     
     # [2026-05-08 优化] 使用流式生成降低内存占用
     return StreamingResponse(
-        generate_aggregated_rss_stream(articles, nickname_map, base_url),
+        generate_aggregated_rss_stream(articles, nickname_map, base_url, feed_token=user.get("feed_token", "")),
         media_type="application/rss+xml; charset=utf-8",
         headers={"Cache-Control": "public, max-age=600"},
     )
@@ -436,7 +436,7 @@ async def get_rss_feed(fakeid: str, request: Request,
     base_url = get_base_url(request)
 
     return StreamingResponse(
-        generate_single_rss_stream(fakeid, sub, articles, base_url),
+        generate_single_rss_stream(fakeid, sub, articles, base_url, feed_token=user.get("feed_token", "")),
         media_type="application/rss+xml; charset=utf-8",
         headers={"Cache-Control": "public, max-age=600"},
     )
@@ -525,7 +525,7 @@ async def get_category_rss_feed(category_id: int, request: Request,
     base_url = get_base_url(request)
 
     return StreamingResponse(
-        generate_category_rss_stream(category, articles, nickname_map, base_url),
+        generate_category_rss_stream(category, articles, nickname_map, base_url, feed_token=user.get("feed_token", "")),
         media_type="application/rss+xml; charset=utf-8",
         headers={"Cache-Control": "public, max-age=600"},
     )

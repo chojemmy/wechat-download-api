@@ -8,7 +8,7 @@
 图片 URL 处理工具
 统一处理微信 CDN HTTP 图片转 HTTPS 代理
 """
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 def proxy_image_url(url: str, base_url: str) -> str:
@@ -32,9 +32,16 @@ def proxy_image_url(url: str, base_url: str) -> str:
     if not url:
         return ""
     
-    # 防止重复代理：如果 URL 已经是代理 URL，直接返回
+    # 已经是本站图片代理 URL 时，规范化域名，避免历史 :5000 或 Basic Auth 路径残留。
     if "/api/image?url=" in url:
-        return url
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            inner = qs.get("url", [""])[0]
+            if inner:
+                return f"{base_url.rstrip('/')}/api/image?url={quote(unquote(inner), safe='')}"
+        except Exception:
+            return url
     
     # 只代理微信 CDN 的图片
     if "mmbiz.qpic.cn" in url or "mmbiz.qlogo.cn" in url or "wx.qlogo.cn" in url:
