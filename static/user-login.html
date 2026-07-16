@@ -18,7 +18,7 @@
     <h1>应用账号登录</h1>
     <p>每个用户登录自己的应用账号后，再扫码绑定自己的微信公众号后台凭证和 RSS 订阅。</p>
     <label>用户名</label><input id="username" autocomplete="username" />
-    <label>密码</label><input id="password" type="password" autocomplete="current-password" />
+    <label>密码（至少 8 位）</label><input id="password" type="password" autocomplete="current-password" minlength="8" />
     <button onclick="login()">登录</button>
     <button class="secondary" onclick="register()">注册新账号</button>
     <div id="msg" class="msg"></div>
@@ -30,11 +30,25 @@ async function submit(path){
   const msg=document.getElementById('msg');
   msg.className='msg'; msg.textContent='';
   if(!username||!password){msg.textContent='请输入用户名和密码';return;}
+  if(path.indexOf('/register')>=0 && password.length<8){msg.textContent='注册密码至少 8 位';return;}
   const res=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
   const data=await res.json().catch(()=>({}));
-  if(!res.ok||!data.success){msg.textContent=data.detail||data.error||'操作失败';return;}
+  if(!res.ok||!data.success){msg.textContent=formatError(data);return;}
   msg.className='msg ok'; msg.textContent='登录成功，正在进入后台...';
   setTimeout(()=>{ location.href='/admin.html'; },500);
+}
+function formatError(data){
+  if(!data) return '操作失败';
+  if(typeof data.detail==='string') return data.detail;
+  if(Array.isArray(data.detail)) return data.detail.map(function(e){
+    var loc=Array.isArray(e.loc)?e.loc[e.loc.length-1]:'';
+    var name=loc==='password'?'密码':(loc==='username'?'用户名':loc);
+    return (name?name+'：':'')+(e.msg||JSON.stringify(e));
+  }).join('\n');
+  if(data.detail) return JSON.stringify(data.detail);
+  if(typeof data.error==='string') return data.error;
+  if(data.error) return JSON.stringify(data.error);
+  return '操作失败';
 }
 function login(){submit('/api/users/login')}
 function register(){submit('/api/users/register')}
