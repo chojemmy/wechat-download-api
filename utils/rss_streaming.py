@@ -137,7 +137,8 @@ def generate_single_rss_stream(
     yield b'<generator>WeChat RSS</generator>\n'
     
     # atom:link
-    atom_link = f'<atom:link href="{_escape_xml(base_url)}/api/rss/{_escape_xml(fakeid)}" rel="self" type="application/rss+xml"/>\n'
+    token_qs = f"?feed_token={_escape_xml(feed_token)}" if feed_token else ""
+    atom_link = f'<atom:link href="{_escape_xml(base_url)}/api/rss/{_escape_xml(fakeid)}{token_qs}" rel="self" type="application/rss+xml"/>\n'
     yield atom_link.encode('utf-8')
     
     # 公众号头像
@@ -260,7 +261,8 @@ def generate_aggregated_rss_stream(
     yield b'<generator>WeChat RSS</generator>\n'
     
     # atom:link
-    atom_link = f'<atom:link href="{_escape_xml(base_url)}/api/rss/all" rel="self" type="application/rss+xml"/>\n'
+    token_qs = f"?feed_token={_escape_xml(feed_token)}" if feed_token else ""
+    atom_link = f'<atom:link href="{_escape_xml(base_url)}/api/rss/all{token_qs}" rel="self" type="application/rss+xml"/>\n'
     yield atom_link.encode('utf-8')
     
     # ==================== 文章列表 ====================
@@ -316,7 +318,8 @@ def generate_category_rss_stream(
     yield b'<generator>WeChat RSS</generator>\n'
     
     # atom:link
-    atom_link = f'<atom:link href="{_escape_xml(base_url)}/api/rss/category/{category_id}" rel="self" type="application/rss+xml"/>\n'
+    token_qs = f"?feed_token={_escape_xml(feed_token)}" if feed_token else ""
+    atom_link = f'<atom:link href="{_escape_xml(base_url)}/api/rss/category/{category_id}{token_qs}" rel="self" type="application/rss+xml"/>\n'
     yield atom_link.encode('utf-8')
     
     # ==================== 文章列表 ====================
